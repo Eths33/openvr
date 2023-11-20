@@ -392,6 +392,10 @@ CMainApplication::CMainApplication( int argc, char *argv[] )
 {
 	memset( m_pSceneConstantBufferData, 0, sizeof( m_pSceneConstantBufferData ) );
 	memset(m_pTrackedCameraConstantBufferData, 0, sizeof(m_pTrackedCameraConstantBufferData));
+	m_pTrackedCameraConstantBufferData[0] = (UINT8*)malloc(sizeof(Matrix4));
+	m_pTrackedCameraConstantBufferData[1] = (UINT8*)malloc(sizeof(Matrix4));
+	m_pTrackedCameraConstantBufferData[2] = (UINT8*)malloc(sizeof(Matrix4));
+	m_pTrackedCameraConstantBufferData[3] = (UINT8*)malloc(sizeof(Matrix4));
 	
 
 	for( int i = 1; i < argc; i++ )
@@ -439,6 +443,10 @@ CMainApplication::~CMainApplication()
 {
 	// work is done in Shutdown
 	dprintf( "Shutdown" );
+	free(m_pTrackedCameraConstantBufferData[0]);
+	free(m_pTrackedCameraConstantBufferData[1]);
+	free(m_pTrackedCameraConstantBufferData[2]);
+	free(m_pTrackedCameraConstantBufferData[3]);
 }
 
 //-----------------------------------------------------------------------------
