@@ -1,4 +1,6 @@
 //========= Copyright Valve Corporation ============//
+// From https://github.com/ValveSoftware/openvr
+// Modified by Rectus
 
 #include <windows.h>
 #include "d3dx12.h"
@@ -32,6 +34,7 @@ enum RTVIndex_t
 	RTV_RIGHT_EYE,
 	RTV_SWAPCHAIN0,
 	RTV_SWAPCHAIN1,
+	RTV_TRACKEDCAMERA,
 	NUM_RTVS
 };
 
@@ -51,6 +54,11 @@ enum CBVSRVIndex_t
 	CBV_LEFT_EYE_RENDER_MODEL_MAX = CBV_LEFT_EYE_RENDER_MODEL0 + vr::k_unMaxTrackedDeviceCount,
 	CBV_RIGHT_EYE_RENDER_MODEL0,
 	CBV_RIGHT_EYE_RENDER_MODEL_MAX = CBV_RIGHT_EYE_RENDER_MODEL0 + vr::k_unMaxTrackedDeviceCount,
+	CBV_TRACKEDCAMERA_LEFT,
+	CBV_TRACKEDCAMERA_RIGHT,
+	CBV_TRACKEDCAMERA_LEFT_EYE,
+	CBV_TRACKEDCAMERA_RIGHT_EYE,
+	SRV_TRACKEDCAMERA,
 	NUM_SRV_CBVS
 };
 
@@ -61,7 +69,7 @@ public:
 	DX12RenderModel( const std::string & sRenderModelName );
 	~DX12RenderModel();
 
-	bool BInit( ID3D12Device *pDevice, ID3D12GraphicsCommandList *pCommandList, ID3D12DescriptorHeap *pCBVSRVHeap, vr::TrackedDeviceIndex_t unTrackedDeviceIndex, const vr::RenderModel_t & vrModel, const vr::RenderModel_TextureMap_t & vrDiffuseTexture );
+	bool BInit( ID3D12Device *pDevice, ID3D12GraphicsCommandList *pCommandList, ID3D12DescriptorHeap *pCBVSRVHeap, vr::TrackedDeviceIndex_t unTrackedDeviceIndex, const vr::RenderModel_t & vrModel, const vr::RenderModel_TextureMap_t & vrDiffuseTexture, uint32_t cameraFrameWidth, uint32_t cameraFrameHeight );
 	void Cleanup();
 	void Draw( vr::EVREye nEye, ID3D12GraphicsCommandList *pCommandList, UINT nCBVSRVDescriptorSize, const Matrix4 &matMVP );
 	const std::string & GetName() const { return m_sModelName; }
@@ -79,6 +87,8 @@ private:
 	vr::TrackedDeviceIndex_t m_unTrackedDeviceIndex;
 	ID3D12DescriptorHeap *m_pCBVSRVHeap;
 	std::string m_sModelName;
+	ComPtr< ID3D12Resource > m_pCameraFrameBufferTexture;
+	ComPtr< ID3D12Resource > m_pCameraFrameBufferTextureHeap;
 };
 
 static bool g_bPrintf = true;
@@ -103,7 +113,11 @@ public:
 
 	void RunMainLoop();
 	bool HandleInput();
+	void SwitchUniverse();
+	void UpdateSeatedTrackingOffset(boolean reset = false);
+	void UpdateTrackedCameraFrame();
 	void ProcessVREvent( const vr::VREvent_t & event );
+	void Spin(float msec);
 	void RenderFrame();
 
 	bool SetupTexturemaps();
@@ -111,21 +125,27 @@ public:
 
 	void SetupScene();
 	void AddCubeToScene( Matrix4 mat, std::vector<float> &vertdata );
+	void AddCameraQuadVertsToScene(std::vector<float>& vertdata);
 	void AddCubeVertex( float fl0, float fl1, float fl2, float fl3, float fl4, std::vector<float> &vertdata );
 
 	void UpdateControllerAxes();
 
 	bool SetupStereoRenderTargets();
 	void SetupCompanionWindow();
+	void SetupPassthroughCameraRenderTarget();
 	void SetupCameras();
 
 	void RenderStereoTargets();
 	void RenderCompanionWindow();
+	void RenderPassthroughCamera(vr::Hmd_Eye nEye);
+	Matrix4 GetTrackedCameraMatrixProjection(vr::Hmd_Eye nEye);
+	Matrix4 GetTrackedCameraMatrixPoseEye(vr::Hmd_Eye nEye);
 	void RenderScene( vr::Hmd_Eye nEye );
 
 	Matrix4 GetHMDMatrixProjectionEye( vr::Hmd_Eye nEye );
 	Matrix4 GetHMDMatrixPoseEye( vr::Hmd_Eye nEye );
 	Matrix4 GetCurrentViewProjectionMatrix( vr::Hmd_Eye nEye );
+	Matrix4 GetTrackedCameraToTrackingSpaceMatrix(vr::Hmd_Eye nEye);
 	void UpdateHMDMatrixPose();
 
 	Matrix4 ConvertSteamVRMatrixToMatrix4( const vr::HmdMatrix34_t &matPose );
@@ -151,6 +171,8 @@ private:
 	vr::TrackedDevicePose_t m_rTrackedDevicePose[ vr::k_unMaxTrackedDeviceCount ];
 	Matrix4 m_rmat4DevicePose[ vr::k_unMaxTrackedDeviceCount ];
 	bool m_rbShowTrackedDevice[ vr::k_unMaxTrackedDeviceCount ];
+	vr::TrackingUniverseOrigin m_rTrackingUniverse;
+	Matrix4 m_rSeatedTrackingOffset;
 
 private: // SDL bookkeeping
 	SDL_Window *m_pCompanionWindow;
@@ -163,6 +185,10 @@ private:
 	int m_iValidPoseCount;
 	int m_iValidPoseCount_Last;
 	bool m_bShowCubes;
+	bool m_bPauseRender;
+	int m_iFrameDelta;
+	unsigned int m_iframeNum;
+	bool m_bForceInterleaved;
 
 	std::string m_strPoseClasses;                            // what classes we saw poses for this frame
 	char m_rDevClassChar[ vr::k_unMaxTrackedDeviceCount ];   // for each device, a character representing its class
@@ -255,12 +281,52 @@ private:
 	FramebufferDesc m_rightEyeDesc;
 
 	bool CreateFrameBuffer( int nWidth, int nHeight, FramebufferDesc &framebufferDesc, RTVIndex_t nRTVIndex );
-	
+
+	UINT8* m_pTextureCubeData;
+	int m_nTextureCubeSize;
+
 	uint32_t m_nRenderWidth;
 	uint32_t m_nRenderHeight;
 
-	std::vector< DX12RenderModel * > m_vecRenderModels;
-	DX12RenderModel *m_rTrackedDeviceToRenderModel[ vr::k_unMaxTrackedDeviceCount ];
+	std::vector< DX12RenderModel* > m_vecRenderModels;
+	DX12RenderModel* m_rTrackedDeviceToRenderModel[vr::k_unMaxTrackedDeviceCount];
+
+
+
+	// Tracked camera members
+
+	bool CreateTrackedCameraFrameBuffer();
+	bool SetupTrackedCamera();
+
+	vr::TrackedCameraHandle_t m_hTrackedCamera;
+	uint32_t m_nCameraFrameWidth;
+	uint32_t m_nCameraFrameHeight;
+	uint32_t m_nCameraFrameBufferSize;
+	uint8_t* m_pCameraFrameBuffer;
+	uint32_t m_nLastFrameSequence;
+	vr::CameraVideoStreamFrameHeader_t m_CurrentFrameHeader;
+	vr::EVRTrackedCameraFrameType m_CameraFrameType;
+	float m_fTrackedCameraProjectionDistance;
+	bool m_bShowPassthrough;
+
+	Matrix4 m_mat4TrackedCameraProjectionLeft;
+	Matrix4 m_mat4TrackedCameraProjectionRight;
+	Matrix4 m_mat4TrackedCameraEyePosLeft;
+	Matrix4 m_mat4TrackedCameraEyePosRight;
+
+	ComPtr< ID3D12PipelineState > m_pCameraPipelineState;
+	uint8_t* m_pCameraBufferStart;
+	unsigned int m_uiCameraIndexSize;
+	ComPtr< ID3D12Resource > m_pTrackedCameraConstantBuffer;
+	ComPtr< ID3D12Resource > m_pTrackedCameraEyeConstantBuffer;
+	D3D12_CPU_DESCRIPTOR_HANDLE m_TrackedCameraConstantBufferView[4];
+	UINT8* m_pTrackedCameraConstantBufferData[4];
+	ComPtr< ID3D12Resource > m_pCameraFrameBufferTexture;
+	ComPtr< ID3D12Resource > m_pCameraFrameBufferTextureHeap;
+	ComPtr< ID3D12Resource > m_pCameraVertexBuffer;
+	ComPtr< ID3D12Resource > m_pCameraIndexBuffer;
+	D3D12_VERTEX_BUFFER_VIEW m_CameraVertexBufferView;
+	D3D12_INDEX_BUFFER_VIEW m_CameraIndexBufferView;
 };
 
 //-----------------------------------------------------------------------------
@@ -301,16 +367,32 @@ CMainApplication::CMainApplication( int argc, char *argv[] )
 	, m_iTrackedControllerCount_Last( -1 )
 	, m_iValidPoseCount( 0 )
 	, m_iValidPoseCount_Last( -1 )
-	, m_iSceneVolumeInit( 20 )
+	, m_iSceneVolumeInit( 4 )
 	, m_strPoseClasses("")
-	, m_bShowCubes( true )
+	, m_bShowCubes( false )
 	, m_nFrameIndex( 0 )
 	, m_fenceEvent( NULL )
 	, m_nRTVDescriptorSize( 0 )
 	, m_nCBVSRVDescriptorSize( 0 )
 	, m_nDSVDescriptorSize( 0 )
+	, m_bPauseRender( false )
+	, m_iFrameDelta( 1 )
+	, m_iframeNum( 0 )
+	, m_bForceInterleaved(false)
+	, m_hTrackedCamera(INVALID_TRACKED_CAMERA_HANDLE)
+	, m_nCameraFrameWidth(0)
+	, m_nCameraFrameHeight(0)
+	, m_nCameraFrameBufferSize(0)
+	, m_pCameraFrameBuffer(nullptr)
+	, m_nLastFrameSequence(0)
+	, m_CameraFrameType(vr::EVRTrackedCameraFrameType::VRTrackedCameraFrameType_MaximumUndistorted)
+	, m_pCameraBufferStart(nullptr)
+	, m_bShowPassthrough(true)
+
 {
 	memset( m_pSceneConstantBufferData, 0, sizeof( m_pSceneConstantBufferData ) );
+	memset(m_pTrackedCameraConstantBufferData, 0, sizeof(m_pTrackedCameraConstantBufferData));
+	
 
 	for( int i = 1; i < argc; i++ )
 	{
@@ -365,15 +447,15 @@ CMainApplication::~CMainApplication()
 //-----------------------------------------------------------------------------
 std::string GetTrackedDeviceString( vr::IVRSystem *pHmd, vr::TrackedDeviceIndex_t unDevice, vr::TrackedDeviceProperty prop, vr::TrackedPropertyError *peError = NULL )
 {
-	uint32_t unRequiredBufferLen = pHmd->GetStringTrackedDeviceProperty( unDevice, prop, NULL, 0, peError );
-	if( unRequiredBufferLen == 0 )
-		return "";
+uint32_t unRequiredBufferLen = pHmd->GetStringTrackedDeviceProperty(unDevice, prop, NULL, 0, peError);
+if (unRequiredBufferLen == 0)
+return "";
 
-	char *pchBuffer = new char[ unRequiredBufferLen ];
-	unRequiredBufferLen = pHmd->GetStringTrackedDeviceProperty( unDevice, prop, pchBuffer, unRequiredBufferLen, peError );
-	std::string sResult = pchBuffer;
-	delete [] pchBuffer;
-	return sResult;
+char* pchBuffer = new char[unRequiredBufferLen];
+unRequiredBufferLen = pHmd->GetStringTrackedDeviceProperty(unDevice, prop, pchBuffer, unRequiredBufferLen, peError);
+std::string sResult = pchBuffer;
+delete[] pchBuffer;
+return sResult;
 }
 
 //-----------------------------------------------------------------------------
@@ -381,7 +463,7 @@ std::string GetTrackedDeviceString( vr::IVRSystem *pHmd, vr::TrackedDeviceIndex_
 //-----------------------------------------------------------------------------
 bool CMainApplication::BInit()
 {
-	if ( SDL_Init( SDL_INIT_VIDEO | SDL_INIT_TIMER ) < 0 )
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
 	{
 		dprintf("%s - SDL could not initialize! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
 		return false;
@@ -389,50 +471,51 @@ bool CMainApplication::BInit()
 
 	// Loading the SteamVR Runtime
 	vr::EVRInitError eError = vr::VRInitError_None;
-	m_pHMD = vr::VR_Init( &eError, vr::VRApplication_Scene );
+	m_pHMD = vr::VR_Init(&eError, vr::VRApplication_Scene);
 
-	if ( eError != vr::VRInitError_None )
+	if (eError != vr::VRInitError_None)
 	{
 		m_pHMD = NULL;
 		char buf[1024];
-		sprintf_s( buf, sizeof( buf ), "Unable to init VR runtime: %s", vr::VR_GetVRInitErrorAsEnglishDescription( eError ) );
-		SDL_ShowSimpleMessageBox( SDL_MESSAGEBOX_ERROR, "VR_Init Failed", buf, NULL );
+		sprintf_s(buf, sizeof(buf), "Unable to init VR runtime: %s", vr::VR_GetVRInitErrorAsEnglishDescription(eError));
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "VR_Init Failed", buf, NULL);
 		return false;
 	}
 
 
-	m_pRenderModels = (vr::IVRRenderModels *)vr::VR_GetGenericInterface( vr::IVRRenderModels_Version, &eError );
-	if( !m_pRenderModels )
+	m_pRenderModels = (vr::IVRRenderModels*)vr::VR_GetGenericInterface(vr::IVRRenderModels_Version, &eError);
+	if (!m_pRenderModels)
 	{
 		m_pHMD = NULL;
 		vr::VR_Shutdown();
 
 		char buf[1024];
-		sprintf_s( buf, sizeof( buf ), "Unable to get render model interface: %s", vr::VR_GetVRInitErrorAsEnglishDescription( eError ) );
-		SDL_ShowSimpleMessageBox( SDL_MESSAGEBOX_ERROR, "VR_Init Failed", buf, NULL );
+		sprintf_s(buf, sizeof(buf), "Unable to get render model interface: %s", vr::VR_GetVRInitErrorAsEnglishDescription(eError));
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "VR_Init Failed", buf, NULL);
 		return false;
 	}
+
 
 	int nWindowPosX = 700;
 	int nWindowPosY = 100;
 	Uint32 unWindowFlags = SDL_WINDOW_SHOWN;
 
-	m_pCompanionWindow = SDL_CreateWindow( "hellovr [D3D12]", nWindowPosX, nWindowPosY, m_nCompanionWindowWidth, m_nCompanionWindowHeight, unWindowFlags );
+	m_pCompanionWindow = SDL_CreateWindow("openvr_trackingtest [D3D12]", nWindowPosX, nWindowPosY, m_nCompanionWindowWidth, m_nCompanionWindowHeight, unWindowFlags);
 	if (m_pCompanionWindow == NULL)
 	{
-		dprintf( "%s - Window could not be created! SDL Error: %s\n", __FUNCTION__, SDL_GetError() );
+		dprintf("%s - Window could not be created! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
 		return false;
 	}
 
 	m_strDriver = "No Driver";
 	m_strDisplay = "No Display";
 
-	m_strDriver = GetTrackedDeviceString( m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String );
-	m_strDisplay = GetTrackedDeviceString( m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SerialNumber_String );
+	m_strDriver = GetTrackedDeviceString(m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String);
+	m_strDisplay = GetTrackedDeviceString(m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SerialNumber_String);
 
-	std::string strWindowTitle = "hellovr [D3D12] - " + m_strDriver + " " + m_strDisplay;
-	SDL_SetWindowTitle( m_pCompanionWindow, strWindowTitle.c_str() );
-	
+	std::string strWindowTitle = "openvr_trackingtest [D3D12] - " + m_strDriver + " " + m_strDisplay;
+	SDL_SetWindowTitle(m_pCompanionWindow, strWindowTitle.c_str());
+
 	// cube array
 	m_iSceneVolumeWidth = m_iSceneVolumeInit;
 	m_iSceneVolumeHeight = m_iSceneVolumeInit;
@@ -440,23 +523,39 @@ bool CMainApplication::BInit()
 
 	m_fScale = 0.3f;
 	m_fScaleSpacing = 4.0f;
- 
+
 	m_fNearClip = 0.1f;
 	m_fFarClip = 30.0f;
- 
- 	m_uiVertcount = 0;
- 
-	if ( !BInitD3D12() )
+	m_fTrackedCameraProjectionDistance = 5.0f;
+
+	m_uiVertcount = 0;
+
+
+	if (!SetupTrackedCamera())
 	{
-		dprintf( "%s - Unable to initialize D3D12!\n", __FUNCTION__ );
 		return false;
 	}
 
-	if ( !BInitCompositor() )
+
+	if (!BInitD3D12())
 	{
-		dprintf( "%s - Failed to initialize VR Compositor!\n", __FUNCTION__ );
+		dprintf("%s - Unable to initialize D3D12!\n", __FUNCTION__);
 		return false;
 	}
+
+	if (!BInitCompositor())
+	{
+		dprintf("%s - Failed to initialize VR Compositor!\n", __FUNCTION__);
+		return false;
+	}
+
+	m_rSeatedTrackingOffset = Matrix4();
+	m_rTrackingUniverse = vr::ETrackingUniverseOrigin::TrackingUniverseStanding;
+	vr::VRCompositor()->SetTrackingSpace(m_rTrackingUniverse);
+
+
+	
+
 
 	return true;
 }
@@ -643,6 +742,13 @@ bool CMainApplication::BInitD3D12()
 	SetupStereoRenderTargets();
 	SetupCompanionWindow();
 	SetupRenderModels();
+	
+
+	if (m_hTrackedCamera != INVALID_TRACKED_CAMERA_HANDLE)
+	{
+		CreateTrackedCameraFrameBuffer();
+		SetupPassthroughCameraRenderTarget();
+	}
 
 	// Do any work that was queued up during loading
 	m_pCommandList->Close();
@@ -727,6 +833,43 @@ bool CMainApplication::HandleInput()
 			{
 				m_bShowCubes = !m_bShowCubes;
 			}
+			if (sdlEvent.key.keysym.sym == SDLK_v)
+			{
+				m_bShowPassthrough = !m_bShowPassthrough;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_u)
+			{
+				SwitchUniverse();
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_p)
+			{
+				m_bPauseRender = !m_bPauseRender;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_m)
+			{
+				m_iFrameDelta = m_iFrameDelta < 10 ? m_iFrameDelta + 1 : 10;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_n)
+			{
+				m_iFrameDelta = m_iFrameDelta > 1 ? m_iFrameDelta - 1 : 1;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_b)
+			{
+				m_iFrameDelta = 1;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_i)
+			{
+				m_bForceInterleaved = !m_bForceInterleaved;
+				vr::VRCompositor()->ForceInterleavedReprojectionOn(m_bForceInterleaved);
+			}	
+			if (sdlEvent.key.keysym.sym == SDLK_UP)
+			{
+				m_fTrackedCameraProjectionDistance += 0.5;
+			}
+			if (sdlEvent.key.keysym.sym == SDLK_DOWN)
+			{
+				m_fTrackedCameraProjectionDistance -= 0.5;
+			}
 		}
 	}
 
@@ -740,15 +883,105 @@ bool CMainApplication::HandleInput()
 	// Process SteamVR controller state
 	for( vr::TrackedDeviceIndex_t unDevice = 0; unDevice < vr::k_unMaxTrackedDeviceCount; unDevice++ )
 	{
-		vr::VRControllerState_t state;
-		if( m_pHMD->GetControllerState( unDevice, &state, sizeof(state) ) )
+		if (m_pHMD->GetTrackedDeviceClass(unDevice) == vr::TrackedDeviceClass_Controller)
 		{
-			m_rbShowTrackedDevice[ unDevice ] = state.ulButtonPressed == 0;
+			vr::VRControllerState_t state;
+			if (m_pHMD->GetControllerState(unDevice, &state, sizeof(state)))
+			{
+				m_rbShowTrackedDevice[unDevice] = state.ulButtonPressed == 0;
+			}
 		}
 	}
 
 	return bRet;
 }
+
+
+
+void CMainApplication::SwitchUniverse()
+{
+	if (m_rTrackingUniverse == vr::ETrackingUniverseOrigin::TrackingUniverseSeated)
+	{
+		m_rTrackingUniverse = vr::ETrackingUniverseOrigin::TrackingUniverseStanding;
+	}
+	else
+	{	
+		m_rTrackingUniverse = vr::ETrackingUniverseOrigin::TrackingUniverseSeated;
+	}
+	vr::VRCompositor()->SetTrackingSpace(m_rTrackingUniverse);
+	UpdateSeatedTrackingOffset(false);
+}
+
+
+
+void CMainApplication::UpdateSeatedTrackingOffset(boolean reset)
+{
+	if (m_rTrackingUniverse == vr::ETrackingUniverseOrigin::TrackingUniverseSeated)
+	{
+		if (reset)
+		{
+			vr::TrackedDevicePose_t pose;
+			m_pHMD->GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin::TrackingUniverseStanding, 0, &pose, 1);
+			m_rSeatedTrackingOffset = ConvertSteamVRMatrixToMatrix4(pose.mDeviceToAbsoluteTracking);
+		}
+		else
+		{
+			vr::HmdMatrix34_t zeroOffset = m_pHMD->GetSeatedZeroPoseToStandingAbsoluteTrackingPose();
+			m_rSeatedTrackingOffset = ConvertSteamVRMatrixToMatrix4(zeroOffset);
+		}
+	}
+	else
+	{
+		m_rSeatedTrackingOffset = Matrix4();
+	}
+}
+
+
+void CMainApplication::UpdateTrackedCameraFrame()
+{
+
+	if (m_hTrackedCamera != INVALID_TRACKED_CAMERA_HANDLE)
+	{
+		vr::EVRTrackedCameraError error;
+
+		vr::CameraVideoStreamFrameHeader_t header;
+
+		error = vr::VRTrackedCamera()->GetVideoStreamFrameBuffer(m_hTrackedCamera, m_CameraFrameType, m_pCameraFrameBuffer, m_nCameraFrameBufferSize, &header, sizeof(header));
+
+		if (error == vr::EVRTrackedCameraError::VRTrackedCameraError_None)
+		{
+			memcpy(&m_CurrentFrameHeader, &header, sizeof(header));
+
+
+
+			D3D12_SUBRESOURCE_FOOTPRINT pitchedDesc = {};
+			pitchedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+			pitchedDesc.Width = m_nCameraFrameWidth;
+			pitchedDesc.Height = m_nCameraFrameHeight;
+			pitchedDesc.Depth = 1;
+			pitchedDesc.RowPitch = m_nCameraFrameWidth * 4;
+
+
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT placedTexture2D = { 0 };
+			placedTexture2D.Offset = 0;
+			placedTexture2D.Footprint = pitchedDesc;
+
+			
+			memcpy(m_pCameraBufferStart, m_pCameraFrameBuffer, sizeof(UINT8) * m_nCameraFrameWidth * m_nCameraFrameHeight * 4);
+
+			m_pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_pCameraFrameBufferTexture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+
+			m_pCommandList->CopyTextureRegion(
+				&CD3DX12_TEXTURE_COPY_LOCATION(m_pCameraFrameBufferTexture.Get(), 0),
+				0, 0, 0,
+				&CD3DX12_TEXTURE_COPY_LOCATION(m_pCameraFrameBufferTextureHeap.Get(), placedTexture2D),
+				nullptr);
+
+			m_pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_pCameraFrameBufferTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+		}
+	}
+}
+
 
 //-----------------------------------------------------------------------------
 // Purpose:
@@ -793,6 +1026,34 @@ void CMainApplication::ProcessVREvent( const vr::VREvent_t & event )
 			dprintf( "Device %u updated.\n", event.trackedDeviceIndex );
 		}
 		break;
+	case vr::VREvent_SeatedZeroPoseReset:
+		{
+			dprintf("Seated zero pose reset.\n");
+			UpdateSeatedTrackingOffset(true);
+		}
+	break;
+	}
+}
+
+void CMainApplication::Spin(float msec)
+{
+	LARGE_INTEGER start, end, elapsed, timer_freq;
+
+	QueryPerformanceFrequency(&timer_freq);
+	QueryPerformanceCounter(&start);
+
+	while (true)
+	{
+		QueryPerformanceCounter(&end);
+		elapsed.QuadPart = end.QuadPart - start.QuadPart;
+
+		elapsed.QuadPart *= 1000;
+		elapsed.QuadPart /= timer_freq.QuadPart;
+
+		if ((float)elapsed.QuadPart > msec)
+		{
+			return;
+		}
 	}
 }
 
@@ -801,6 +1062,23 @@ void CMainApplication::ProcessVREvent( const vr::VREvent_t & event )
 //-----------------------------------------------------------------------------
 void CMainApplication::RenderFrame()
 {
+	float freq = m_pHMD->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, NULL);
+	if (freq == 0.0F)
+	{
+		freq = 90.0F;
+	}
+
+	if (m_bPauseRender)
+	{
+		Spin(1000.0F / freq);
+		return;
+	}
+	while (++m_iframeNum % m_iFrameDelta != 0)
+	{	
+		Spin(1000.0F / freq);
+		//return;
+	}
+
 	if ( m_pHMD )
 	{
 		m_pCommandAllocators[ m_nFrameIndex ]->Reset();
@@ -811,6 +1089,7 @@ void CMainApplication::RenderFrame()
 		ID3D12DescriptorHeap *ppHeaps[] = { m_pCBVSRVHeap.Get() };
 		m_pCommandList->SetDescriptorHeaps( _countof( ppHeaps ), ppHeaps );
 
+		UpdateTrackedCameraFrame();
 		UpdateControllerAxes();
 		RenderStereoTargets();
 		RenderCompanionWindow();
@@ -883,13 +1162,15 @@ bool CMainApplication::CreateAllShaders()
 			featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
 		}
 		
-		CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
-		CD3DX12_ROOT_PARAMETER1 rootParameters[2];
+		CD3DX12_DESCRIPTOR_RANGE1 ranges[3];
+		CD3DX12_ROOT_PARAMETER1 rootParameters[3];
 		
 		ranges[0].Init( D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC );
 		ranges[1].Init( D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0 );
+		ranges[2].Init( D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
 		rootParameters[0].InitAsDescriptorTable( 1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX );
 		rootParameters[1].InitAsDescriptorTable( 1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL );
+		rootParameters[2].InitAsDescriptorTable( 1, &ranges[2], D3D12_SHADER_VISIBILITY_VERTEX );
 		
 		D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
 			D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
@@ -965,6 +1246,64 @@ bool CMainApplication::CreateAllShaders()
 			return false;
 		}
 	}
+
+
+	// Passthrough camera shader
+	{
+		ComPtr<ID3DBlob> vertexShader;
+		ComPtr<ID3DBlob> pixelShader;
+		UINT compileFlags = 0;
+
+		std::string shaderPath = Path_MakeAbsolute("../shaders/passthrough.hlsl", sExecutableDirectory);
+		std::wstring shaderPathW = std::wstring(shaderPath.begin(), shaderPath.end());
+		ComPtr< ID3DBlob > error;
+		if (FAILED(D3DCompileFromFile(shaderPathW.c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, &error)))
+		{
+			dprintf("Failed compiling vertex shader '%s':\n%s\n", shaderPath.c_str(), (char*)error->GetBufferPointer());
+			return false;
+		}
+		if (FAILED(D3DCompileFromFile(shaderPathW.c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, &error)))
+		{
+			dprintf("Failed compiling pixel shader '%s':\n%s\n", shaderPath.c_str(), (char*)error->GetBufferPointer());
+			return false;
+		}
+
+		// Define the vertex input layout.
+		D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
+		{
+			{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		};
+
+		// Describe and create the graphics pipeline state object (PSO).
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+		psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
+		psoDesc.pRootSignature = m_pRootSignature.Get();
+		psoDesc.VS = CD3DX12_SHADER_BYTECODE(vertexShader.Get());
+		psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.Get());
+		psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+		psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		psoDesc.RasterizerState.FrontCounterClockwise = TRUE;
+		psoDesc.RasterizerState.MultisampleEnable = TRUE;
+		psoDesc.RasterizerState.DepthClipEnable = FALSE;
+		psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+		psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+		psoDesc.DepthStencilState.DepthEnable = FALSE;
+		psoDesc.DepthStencilState.StencilEnable = FALSE;
+		psoDesc.SampleMask = UINT_MAX;
+		psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		psoDesc.NumRenderTargets = 1;
+		psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+		psoDesc.SampleDesc.Count = m_nMSAASampleCount;
+		psoDesc.SampleDesc.Quality = 0;
+		if (FAILED(m_pDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_pCameraPipelineState))))
+		{
+			dprintf("Error creating D3D12 pipeline state.\n");
+			return false;
+		}
+	}
+
 
 	// Companion shader
 	{
@@ -1144,7 +1483,11 @@ bool CMainApplication::SetupTexturemaps()
 	std::vector< D3D12_SUBRESOURCE_DATA > mipLevelData;
 	UINT8 *pBaseData = new UINT8[ nImageWidth * nImageHeight * 4 ];
 	memcpy( pBaseData, &imageRGBA[0], sizeof( UINT8 ) * nImageWidth * nImageHeight * 4 );
-	
+
+	m_pTextureCubeData = new UINT8[nImageWidth * nImageHeight * 4];
+	memcpy(m_pTextureCubeData, &imageRGBA[0], sizeof(UINT8) * nImageWidth * nImageHeight * 4);
+	m_nTextureCubeSize = sizeof(UINT8) * nImageWidth * nImageHeight * 4;
+
 	D3D12_SUBRESOURCE_DATA textureData = {};
 	textureData.pData = &pBaseData[ 0 ];
 	textureData.RowPitch = nImageWidth * 4;
@@ -1305,7 +1648,11 @@ void CMainApplication::SetupScene()
 		}
 		mat = mat * Matrix4().translate( 0, -((float)m_iSceneVolumeHeight) * m_fScaleSpacing, m_fScaleSpacing );
 	}
+
 	m_uiVertcount = vertdataarray.size()/5;
+
+
+	AddCameraQuadVertsToScene(vertdataarray);
 	
 	m_pDevice->CreateCommittedResource( &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), 
 		D3D12_HEAP_FLAG_NONE,
@@ -1396,6 +1743,20 @@ void CMainApplication::AddCubeToScene( Matrix4 mat, std::vector<float> &vertdata
 	AddCubeVertex( G.x, G.y, G.z, 0, 0, vertdata );
 	AddCubeVertex( F.x, F.y, F.z, 0, 1, vertdata );
 }
+
+
+void CMainApplication::AddCameraQuadVertsToScene(std::vector<float>& vertdata)
+{
+	float zVal = 0.1f;
+
+	AddCubeVertex(0, 1, zVal, 0, 1, vertdata);
+	AddCubeVertex(1, 1, zVal, 1, 1, vertdata);
+	AddCubeVertex(1, 0, zVal, 1, 0, vertdata);
+	AddCubeVertex(1, 0, zVal, 1, 0, vertdata);
+	AddCubeVertex(0, 0, zVal, 0, 0, vertdata);
+	AddCubeVertex(0, 1, zVal, 0, 1, vertdata);
+}
+
 
 //-----------------------------------------------------------------------------
 // Purpose: Update the vertex data for the controllers as X/Y/Z lines
@@ -1496,6 +1857,151 @@ void CMainApplication::UpdateControllerAxes()
 		m_pControllerAxisVertexBuffer->Unmap( 0, nullptr );
 	}
 }
+
+
+bool CMainApplication::CreateTrackedCameraFrameBuffer()
+{
+
+	UINT8* pBaseData = new UINT8[m_nCameraFrameWidth * m_nCameraFrameHeight * 4];
+
+	D3D12_SUBRESOURCE_DATA textureData = {};
+	textureData.pData = &pBaseData[0];
+	textureData.RowPitch = m_nCameraFrameWidth * 4;
+	textureData.SlicePitch = textureData.RowPitch * m_nCameraFrameHeight;
+
+
+	D3D12_RESOURCE_DESC textureDesc = {};
+	textureDesc.MipLevels = 1;
+	textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	textureDesc.Width = m_nCameraFrameWidth;
+	textureDesc.Height = m_nCameraFrameHeight;
+	textureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	textureDesc.DepthOrArraySize = 1;
+	textureDesc.SampleDesc.Count = 1;
+	textureDesc.SampleDesc.Quality = 0;
+	textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+
+	HRESULT result = m_pDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&textureDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&m_pCameraFrameBufferTexture));
+
+	if (result != 0)
+	{
+		dprintf("Failed\n");
+		return false;
+	}
+	
+
+
+	int bufferSize = m_nCameraFrameWidth * m_nCameraFrameHeight * sizeof(UINT8) * 4;
+
+	result = m_pDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(bufferSize, D3D12_RESOURCE_FLAG_NONE),
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+		IID_PPV_ARGS(&m_pCameraFrameBufferTextureHeap));
+
+	if (SUCCEEDED(result))
+	{
+		void* pData;
+		CD3DX12_RANGE readRange(0, 0);
+		m_pCameraFrameBufferTextureHeap->Map(0, &readRange, &pData);
+		m_pCameraBufferStart = reinterpret_cast<UINT8*>(pData);
+		//m_pDataCur = m_pDataBegin = reinterpret_cast<UINT8*>(pData);
+		//m_pDataEnd = m_pDataBegin + uSize;
+
+	}
+	else
+	{
+		dprintf("Failed\n");
+		return false;
+	}
+
+	// Create shader resource view
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(m_pCBVSRVHeap->GetCPUDescriptorHandleForHeapStart());
+	srvHandle.Offset(SRV_TRACKEDCAMERA, m_nCBVSRVDescriptorSize);
+	m_pDevice->CreateShaderResourceView(m_pCameraFrameBufferTexture.Get(), nullptr, srvHandle);
+	m_textureShaderResourceView = srvHandle;
+	
+	UpdateSubresources(m_pCommandList.Get(), m_pCameraFrameBufferTexture.Get(), m_pCameraFrameBufferTextureHeap.Get(), 0, 0, 1, &textureData);
+
+
+	m_pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_pCameraFrameBufferTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+
+	return true;
+}
+
+
+bool CMainApplication::SetupTrackedCamera()
+{
+	bool bHasCamera = false;
+	vr::EVRTrackedCameraError nCameraError = vr::VRTrackedCamera()->HasCamera(vr::k_unTrackedDeviceIndex_Hmd, &bHasCamera);
+	if (nCameraError != vr::VRTrackedCameraError_None)
+	{
+		dprintf("Tracked Camera Error! (%s)\n", vr::VRTrackedCamera()->GetCameraErrorNameFromEnum(nCameraError));
+		return false;
+	}
+
+	if (!bHasCamera)
+	{
+		dprintf("No Tracked Camera Available!\n");
+		return true;
+	}
+
+	vr::ETrackedPropertyError propertyError;
+	char buffer[128];
+	vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraFirmwareDescription_String, buffer, sizeof(buffer), &propertyError);
+	if (propertyError != vr::TrackedProp_Success)
+	{
+		dprintf("Failed to get tracked camera firmware description!\n");
+		return false;
+	}
+
+	dprintf("Camera Firmware: %s\n\n", buffer);
+
+
+
+	uint32_t nNewBufferSize = 0;
+	if (vr::VRTrackedCamera()->GetCameraFrameSize(vr::k_unTrackedDeviceIndex_Hmd, vr::VRTrackedCameraFrameType_Undistorted, &m_nCameraFrameWidth, &m_nCameraFrameHeight, &nNewBufferSize) != vr::VRTrackedCameraError_None)
+	{
+		dprintf("GetCameraFrameBounds() Failed!\n");
+		return false;
+	}
+
+
+	if (nNewBufferSize && nNewBufferSize != m_nCameraFrameBufferSize)
+	{
+		delete[] m_pCameraFrameBuffer;
+		m_nCameraFrameBufferSize = nNewBufferSize;
+		m_pCameraFrameBuffer = new uint8_t[m_nCameraFrameBufferSize];
+		memset(m_pCameraFrameBuffer, 0, m_nCameraFrameBufferSize);
+	}
+
+	
+
+	vr::VRTrackedCamera()->AcquireVideoStreamingService(vr::k_unTrackedDeviceIndex_Hmd, &m_hTrackedCamera);
+	if (m_hTrackedCamera == INVALID_TRACKED_CAMERA_HANDLE)
+	{
+		dprintf("AcquireVideoStreamingService() Failed!\n");
+		return false;
+	}
+
+
+	m_mat4TrackedCameraProjectionLeft = GetTrackedCameraMatrixProjection(vr::Eye_Left);
+	m_mat4TrackedCameraProjectionRight = GetTrackedCameraMatrixProjection(vr::Eye_Right);
+	m_mat4TrackedCameraEyePosLeft = GetTrackedCameraMatrixPoseEye(vr::Eye_Left);
+	m_mat4TrackedCameraEyePosRight = GetTrackedCameraMatrixPoseEye(vr::Eye_Right);
+	
+	return true;
+}
+
+
 
 //-----------------------------------------------------------------------------
 // Purpose:
@@ -1639,6 +2145,137 @@ void CMainApplication::SetupCompanionWindow()
 	m_companionWindowIndexBufferView.SizeInBytes = sizeof( vIndices );
 }
 
+
+void CMainApplication::SetupPassthroughCameraRenderTarget()
+{
+	if (!m_pHMD)
+		return;
+
+	std::vector<VertexDataWindow> vVerts;
+
+	// The input positions span half the clip space horizontally since the projection matrix streches them out to cover both halves of the frame.
+
+	// left eye verts
+	vVerts.push_back(VertexDataWindow(Vector2(-1, -1), Vector2(0, 1)));
+	vVerts.push_back(VertexDataWindow(Vector2(0, -1), Vector2(0.5, 1)));
+	vVerts.push_back(VertexDataWindow(Vector2(-1, 1), Vector2(0, 0)));
+	vVerts.push_back(VertexDataWindow(Vector2(0, 1), Vector2(0.5, 0)));
+
+	// right eye verts
+	vVerts.push_back(VertexDataWindow(Vector2(-1, -1), Vector2(0.5, 1)));
+	vVerts.push_back(VertexDataWindow(Vector2(0, -1), Vector2(1, 1)));
+	vVerts.push_back(VertexDataWindow(Vector2(-1, 1), Vector2(0.5, 0)));
+	vVerts.push_back(VertexDataWindow(Vector2(0, 1), Vector2(1, 0)));
+	
+
+	m_pDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(sizeof(VertexDataWindow) * vVerts.size()),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_pCameraVertexBuffer));
+
+	UINT8* pMappedBuffer;
+	CD3DX12_RANGE readRange(0, 0);
+	m_pCameraVertexBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pMappedBuffer));
+	memcpy(pMappedBuffer, &vVerts[0], sizeof(VertexDataWindow) * vVerts.size());
+	m_pCameraVertexBuffer->Unmap(0, nullptr);
+
+	m_CameraVertexBufferView.BufferLocation = m_pCameraVertexBuffer->GetGPUVirtualAddress();
+	m_CameraVertexBufferView.StrideInBytes = sizeof(VertexDataWindow);
+	m_CameraVertexBufferView.SizeInBytes = sizeof(VertexDataWindow) * vVerts.size();
+
+
+	UINT16 vIndices[] = { 0, 1, 3,   0, 3, 2,   4, 5, 7,   4, 7, 6 };
+	m_uiCameraIndexSize = _countof(vIndices);
+
+	m_pDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(sizeof(vIndices)),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_pCameraIndexBuffer));
+
+	m_pCameraIndexBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pMappedBuffer));
+	memcpy(pMappedBuffer, &vIndices[0], sizeof(vIndices));
+	m_pCameraIndexBuffer->Unmap(0, nullptr);
+
+	m_CameraIndexBufferView.BufferLocation = m_pCameraIndexBuffer->GetGPUVirtualAddress();
+	m_CameraIndexBufferView.Format = DXGI_FORMAT_R16_UINT;
+	m_CameraIndexBufferView.SizeInBytes = sizeof(vIndices);
+
+	{
+		m_pDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(1024 * 64),
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			nullptr,
+			IID_PPV_ARGS(&m_pTrackedCameraConstantBuffer));
+
+		// Keep as persistently mapped buffer, store left eye in first 256 bytes, right eye in second
+		UINT8* pBuffer;
+		CD3DX12_RANGE readCBVRange(0, 0);
+		m_pTrackedCameraConstantBuffer->Map(0, &readCBVRange, reinterpret_cast<void**>(&pBuffer));
+
+		m_pTrackedCameraConstantBufferData[0] = pBuffer;
+		m_pTrackedCameraConstantBufferData[1] = pBuffer + 256;
+
+
+		// Left eye CBV
+		CD3DX12_CPU_DESCRIPTOR_HANDLE cbvLeftEyeHandle(m_pCBVSRVHeap->GetCPUDescriptorHandleForHeapStart());
+		cbvLeftEyeHandle.Offset(CBV_TRACKEDCAMERA_LEFT, m_nCBVSRVDescriptorSize);
+		D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+		cbvDesc.BufferLocation = m_pTrackedCameraConstantBuffer->GetGPUVirtualAddress();
+		cbvDesc.SizeInBytes = 256;
+		m_pDevice->CreateConstantBufferView(&cbvDesc, cbvLeftEyeHandle);
+		m_TrackedCameraConstantBufferView[0] = cbvLeftEyeHandle;
+
+		// Right eye CBV
+		CD3DX12_CPU_DESCRIPTOR_HANDLE cbvRightEyeHandle(m_pCBVSRVHeap->GetCPUDescriptorHandleForHeapStart());
+		cbvRightEyeHandle.Offset(CBV_TRACKEDCAMERA_RIGHT, m_nCBVSRVDescriptorSize);
+		cbvDesc.BufferLocation += 256;
+		m_pDevice->CreateConstantBufferView(&cbvDesc, cbvRightEyeHandle);
+		m_TrackedCameraConstantBufferView[1] = cbvRightEyeHandle;
+	}
+
+	// Can't figure out how to get two matrices in the same bufer, so making two of them
+	{
+		m_pDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(1024 * 64),
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			nullptr,
+			IID_PPV_ARGS(&m_pTrackedCameraEyeConstantBuffer));
+
+		UINT8* pBuffer;
+		CD3DX12_RANGE readCBVRange(0, 0);
+		m_pTrackedCameraEyeConstantBuffer->Map(0, &readCBVRange, reinterpret_cast<void**>(&pBuffer));
+
+		m_pTrackedCameraConstantBufferData[2] = pBuffer;
+		m_pTrackedCameraConstantBufferData[3] = pBuffer + 256;
+
+
+		// Left eye CBV
+		CD3DX12_CPU_DESCRIPTOR_HANDLE cbvLeftEyeHandle(m_pCBVSRVHeap->GetCPUDescriptorHandleForHeapStart());
+		cbvLeftEyeHandle.Offset(CBV_TRACKEDCAMERA_LEFT_EYE, m_nCBVSRVDescriptorSize);
+		D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+		cbvDesc.BufferLocation = m_pTrackedCameraEyeConstantBuffer->GetGPUVirtualAddress();
+		cbvDesc.SizeInBytes = 256;
+		m_pDevice->CreateConstantBufferView(&cbvDesc, cbvLeftEyeHandle);
+		m_TrackedCameraConstantBufferView[2] = cbvLeftEyeHandle;
+
+		// Right eye CBV
+		CD3DX12_CPU_DESCRIPTOR_HANDLE cbvRightEyeHandle(m_pCBVSRVHeap->GetCPUDescriptorHandleForHeapStart());
+		cbvRightEyeHandle.Offset(CBV_TRACKEDCAMERA_RIGHT_EYE, m_nCBVSRVDescriptorSize);
+		cbvDesc.BufferLocation += 256;
+		m_pDevice->CreateConstantBufferView(&cbvDesc, cbvRightEyeHandle);
+		m_TrackedCameraConstantBufferView[3] = cbvRightEyeHandle;
+	}
+}
+
+
 //-----------------------------------------------------------------------------
 // Purpose:
 //-----------------------------------------------------------------------------
@@ -1660,9 +2297,10 @@ void CMainApplication::RenderStereoTargets()
 	const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 	m_pCommandList->ClearRenderTargetView( m_leftEyeDesc.m_renderTargetViewHandle, clearColor, 0, nullptr );
 	m_pCommandList->ClearDepthStencilView( m_leftEyeDesc.m_depthStencilViewHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, 0, nullptr );
-
-	RenderScene( vr::Eye_Left );
 	
+	RenderPassthroughCamera(vr::Eye_Left);
+	RenderScene(vr::Eye_Left);
+
 	// Transition to SHADER_RESOURCE to submit to SteamVR
 	m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_leftEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
 
@@ -1677,7 +2315,8 @@ void CMainApplication::RenderStereoTargets()
 	m_pCommandList->ClearRenderTargetView( m_rightEyeDesc.m_renderTargetViewHandle, clearColor, 0, nullptr );
 	m_pCommandList->ClearDepthStencilView( m_rightEyeDesc.m_depthStencilViewHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, 0, nullptr );
 
-	RenderScene( vr::Eye_Right );
+	RenderPassthroughCamera(vr::Eye_Right);
+	RenderScene(vr::Eye_Right);
 	
 	// Transition to SHADER_RESOURCE to submit to SteamVR
 	m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_rightEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
@@ -1709,6 +2348,7 @@ void CMainApplication::RenderScene( vr::Hmd_Eye nEye )
 		m_pCommandList->IASetPrimitiveTopology( D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST );
 		m_pCommandList->IASetVertexBuffers( 0, 1, &m_sceneVertexBufferView );
 		m_pCommandList->DrawInstanced( m_uiVertcount, 1, 0, 0 );
+
 	}
 
 	bool bIsInputAvailable = m_pHMD->IsInputAvailable();
@@ -1725,22 +2365,39 @@ void CMainApplication::RenderScene( vr::Hmd_Eye nEye )
 
 	// ----- Render Model rendering -----
 	m_pCommandList->SetPipelineState( m_pRenderModelPipelineState.Get() );
-	for( uint32_t unTrackedDevice = 0; unTrackedDevice < vr::k_unMaxTrackedDeviceCount; unTrackedDevice++ )
+	for (uint32_t unTrackedDevice = 0; unTrackedDevice < vr::k_unMaxTrackedDeviceCount; unTrackedDevice++)
 	{
-		if( !m_rTrackedDeviceToRenderModel[ unTrackedDevice ] || !m_rbShowTrackedDevice[ unTrackedDevice ] )
+		if (!m_rTrackedDeviceToRenderModel[unTrackedDevice] || !m_rbShowTrackedDevice[unTrackedDevice])
 			continue;
 
-		const vr::TrackedDevicePose_t & pose = m_rTrackedDevicePose[ unTrackedDevice ];
-		if( !pose.bPoseIsValid )
+		const vr::TrackedDevicePose_t & pose = m_rTrackedDevicePose[unTrackedDevice];
+		if (!pose.bPoseIsValid)
 			continue;
 
-		if( !bIsInputAvailable && m_pHMD->GetTrackedDeviceClass( unTrackedDevice ) == vr::TrackedDeviceClass_Controller )
+		if (!bIsInputAvailable && m_pHMD->GetTrackedDeviceClass(unTrackedDevice) == vr::TrackedDeviceClass_Controller)
 			continue;
 
-		const Matrix4 & matDeviceToTracking = m_rmat4DevicePose[ unTrackedDevice ];
-		Matrix4 matMVP = GetCurrentViewProjectionMatrix( nEye ) * matDeviceToTracking;
-		
-		m_rTrackedDeviceToRenderModel[ unTrackedDevice ]->Draw( nEye, m_pCommandList.Get(), m_nCBVSRVDescriptorSize, matMVP );
+		Matrix4 matMVP;
+
+		if (m_pHMD->GetTrackedDeviceClass(unTrackedDevice) == vr::TrackedDeviceClass_HMD)
+		{
+			// Render the rendermodel of the HMD on the seated zero point if standing, otherwise on the roomscale origin.
+			if (vr::VRCompositor()->GetTrackingSpace() == vr::TrackingUniverseOrigin::TrackingUniverseStanding)
+			{
+				Matrix4 zero = ConvertSteamVRMatrixToMatrix4(m_pHMD->GetSeatedZeroPoseToStandingAbsoluteTrackingPose());
+				matMVP = GetCurrentViewProjectionMatrix(nEye) * zero;
+			}
+			else
+			{
+				matMVP = GetCurrentViewProjectionMatrix(nEye);
+			}
+		}
+		else
+		{
+			const Matrix4 & matDeviceToTracking = m_rmat4DevicePose[unTrackedDevice];
+			matMVP = GetCurrentViewProjectionMatrix(nEye) * matDeviceToTracking;
+		}
+		m_rTrackedDeviceToRenderModel[unTrackedDevice]->Draw(nEye, m_pCommandList.Get(), m_nCBVSRVDescriptorSize, matMVP);
 	}
 }
 
@@ -1786,6 +2443,130 @@ void CMainApplication::RenderCompanionWindow()
 	m_pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition( m_pSwapChainRenderTarget[ m_nFrameIndex ].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT ) );
 }
 
+
+//-----------------------------------------------------------------------------
+// Purpose:
+//-----------------------------------------------------------------------------
+void CMainApplication::RenderPassthroughCamera(vr::Hmd_Eye nEye)
+{
+	if (!m_bShowPassthrough)
+	{
+		return;
+	}
+
+	m_pCommandList->SetPipelineState(m_pCameraPipelineState.Get());
+
+	// Transformation from tracking space to the HMD view
+	{
+		CBVSRVIndex_t cbvIndex = nEye == vr::Hmd_Eye::Eye_Left ? CBV_TRACKEDCAMERA_LEFT : CBV_TRACKEDCAMERA_RIGHT;
+
+		CD3DX12_GPU_DESCRIPTOR_HANDLE cbvHandle(m_pCBVSRVHeap->GetGPUDescriptorHandleForHeapStart());
+		cbvHandle.Offset(cbvIndex, m_nCBVSRVDescriptorSize);
+		m_pCommandList->SetGraphicsRootDescriptorTable(0, cbvHandle);
+
+		Matrix4 Mat = GetCurrentViewProjectionMatrix(nEye);
+	 	memcpy(m_pTrackedCameraConstantBufferData[nEye], Mat.get(), sizeof(Matrix4));
+	}
+
+	// Transformation from undistorted camera image space to tracking space
+	{
+		CBVSRVIndex_t cbvIndex = nEye == vr::Hmd_Eye::Eye_Left ? CBV_TRACKEDCAMERA_LEFT_EYE : CBV_TRACKEDCAMERA_RIGHT_EYE;
+
+		CD3DX12_GPU_DESCRIPTOR_HANDLE cbvHandle(m_pCBVSRVHeap->GetGPUDescriptorHandleForHeapStart());
+		cbvHandle.Offset(cbvIndex, m_nCBVSRVDescriptorSize);
+		m_pCommandList->SetGraphicsRootDescriptorTable(2, cbvHandle);
+
+		memcpy(m_pTrackedCameraConstantBufferData[2 + nEye], GetTrackedCameraToTrackingSpaceMatrix(nEye).get(), sizeof(Matrix4));
+	}
+
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(m_pCBVSRVHeap->GetGPUDescriptorHandleForHeapStart());
+	srvHandle.Offset(SRV_TRACKEDCAMERA, m_nCBVSRVDescriptorSize);
+	m_pCommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
+
+	if (nEye == vr::Hmd_Eye::Eye_Left)
+	{
+		m_pCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		m_pCommandList->IASetVertexBuffers(0, 1, &m_CameraVertexBufferView);
+		m_pCommandList->IASetIndexBuffer(&m_CameraIndexBufferView);
+		m_pCommandList->DrawIndexedInstanced(m_uiCameraIndexSize / 2, 1, 0, 0, 0);
+	}
+	else
+	{
+		m_pCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		m_pCommandList->IASetVertexBuffers(0, 1, &m_CameraVertexBufferView);
+		m_pCommandList->IASetIndexBuffer(&m_CameraIndexBufferView);
+		m_pCommandList->DrawIndexedInstanced(m_uiCameraIndexSize / 2, 1, (m_uiCameraIndexSize / 2), 0, 0);
+	}	
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Transformation from camera image space to camera view space.
+//-----------------------------------------------------------------------------
+Matrix4 CMainApplication::GetTrackedCameraMatrixProjection(vr::Hmd_Eye nEye)
+{
+	if (!m_hTrackedCamera)
+		return Matrix4();
+
+	uint32_t cameraIndex = nEye == vr::Hmd_Eye::Eye_Left ? 0 : 1;
+
+	vr::HmdMatrix44_t mat;
+
+	vr::EVRTrackedCameraError error1 = vr::VRTrackedCamera()->GetCameraProjection(vr::k_unTrackedDeviceIndex_Hmd, cameraIndex, m_CameraFrameType, m_fNearClip, m_fTrackedCameraProjectionDistance, &mat);
+
+	if (error1 != vr::EVRTrackedCameraError::VRTrackedCameraError_None)
+	{
+		dprintf("Unable to get camera projection matrix: %s\n", vr::VRTrackedCamera()->GetCameraErrorNameFromEnum(error1));
+		return Matrix4();
+	}
+
+	Matrix4 matrixObj(
+		mat.m[0][0], mat.m[1][0], mat.m[2][0], mat.m[3][0],
+		mat.m[0][1], mat.m[1][1], mat.m[2][1], mat.m[3][1],
+		mat.m[0][2], mat.m[1][2], mat.m[2][2], mat.m[3][2],
+		mat.m[0][3], mat.m[1][3], mat.m[2][3], mat.m[3][3]
+	);
+	
+	matrixObj.invert();
+
+	return matrixObj;
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Transformation from HMD space to camera view space.
+//-----------------------------------------------------------------------------
+Matrix4 CMainApplication::GetTrackedCameraMatrixPoseEye(vr::Hmd_Eye nEye)
+{
+	if (!m_hTrackedCamera)
+		return Matrix4();
+
+	vr::HmdMatrix34_t matrix[2];
+	vr::TrackedPropertyError error;
+
+	vr::VRSystem()->GetArrayTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraToHeadTransforms_Matrix34_Array, vr::k_unHmdMatrix34PropertyTag, &matrix, sizeof(matrix), &error);
+
+	if (error != vr::TrackedPropertyError::TrackedProp_Success)
+	{
+		dprintf("Unable to get camera eye matrix: %s\n", vr::VRSystem()->GetPropErrorNameFromEnum(error));
+		return Matrix4();
+	}
+	uint32_t cameraIndex = nEye == vr::Hmd_Eye::Eye_Left ? 0 : 1;
+
+	vr::HmdMatrix34_t matCamera = matrix[cameraIndex];
+	Matrix4 matrixObj(
+		matCamera.m[0][0], matCamera.m[1][0], matCamera.m[2][0], 0.0,
+		matCamera.m[0][1], matCamera.m[1][1], matCamera.m[2][1], 0.0,
+		matCamera.m[0][2], matCamera.m[1][2], matCamera.m[2][2], 0.0,
+		matCamera.m[0][3], matCamera.m[1][3], matCamera.m[2][3], 1.0f
+	);
+
+	return matrixObj;
+}
+
+
+
 //-----------------------------------------------------------------------------
 // Purpose: Gets a Matrix Projection Eye with respect to nEye.
 //-----------------------------------------------------------------------------
@@ -1803,6 +2584,8 @@ Matrix4 CMainApplication::GetHMDMatrixProjectionEye( vr::Hmd_Eye nEye )
 		mat.m[0][3], mat.m[1][3], mat.m[2][3], mat.m[3][3]
 	);
 }
+
+
 
 
 //-----------------------------------------------------------------------------
@@ -1830,18 +2613,63 @@ Matrix4 CMainApplication::GetHMDMatrixPoseEye( vr::Hmd_Eye nEye )
 //-----------------------------------------------------------------------------
 Matrix4 CMainApplication::GetCurrentViewProjectionMatrix( vr::Hmd_Eye nEye )
 {
+	Matrix4 seatedOffset = m_rSeatedTrackingOffset;
+	seatedOffset.invert();
 	Matrix4 matMVP;
 	if( nEye == vr::Eye_Left )
 	{
-		matMVP = m_mat4ProjectionLeft * m_mat4eyePosLeft * m_mat4HMDPose;
+		matMVP = m_mat4ProjectionLeft * m_mat4eyePosLeft * m_mat4HMDPose * seatedOffset;
 	}
 	else if( nEye == vr::Eye_Right )
 	{
-		matMVP = m_mat4ProjectionRight * m_mat4eyePosRight *  m_mat4HMDPose;
+		matMVP = m_mat4ProjectionRight * m_mat4eyePosRight *  m_mat4HMDPose * seatedOffset;
 	}
 
 	return matMVP;
 }
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Transformation from undistorted camera image space to tracking space
+//-----------------------------------------------------------------------------
+Matrix4 CMainApplication::GetTrackedCameraToTrackingSpaceMatrix(vr::Hmd_Eye nEye)
+{
+	// This pose is of the time the camera frame was captured. 
+	// Transforming the image to tracking space with this will 
+	// project it correctly to the position it was taken and not need any further temportal reprojection.
+	vr::HmdMatrix34_t mat = m_CurrentFrameHeader.trackedDevicePose.mDeviceToAbsoluteTracking;
+
+	Matrix4 LeftCameraToTracking(
+		mat.m[0][0], mat.m[1][0], mat.m[2][0], 0.0f,
+		mat.m[0][1], mat.m[1][1], mat.m[2][1], 0.0f,
+		mat.m[0][2], mat.m[1][2], mat.m[2][2], 0.0f,
+		mat.m[0][3], mat.m[1][3], mat.m[2][3], 1.0f
+	);
+
+	Matrix4 trackedCameraMatrix;
+
+	if (nEye == vr::Eye_Left)
+	{	
+		m_mat4TrackedCameraProjectionLeft = GetTrackedCameraMatrixProjection(nEye);
+
+		trackedCameraMatrix = LeftCameraToTracking * m_mat4TrackedCameraProjectionLeft;
+	}
+	else if (nEye == vr::Eye_Right)
+	{
+		// Get the right camera relative to the left
+		Matrix4 leftCameraPos(m_mat4TrackedCameraEyePosLeft);
+		leftCameraPos.invert();
+		Matrix4 cameraOffset(leftCameraPos * m_mat4TrackedCameraEyePosRight);
+
+
+		m_mat4TrackedCameraProjectionRight = GetTrackedCameraMatrixProjection(nEye);
+
+		trackedCameraMatrix = LeftCameraToTracking * cameraOffset * m_mat4TrackedCameraProjectionRight;
+	}
+
+	return trackedCameraMatrix;
+}
+
 
 //-----------------------------------------------------------------------------
 // Purpose:
@@ -1874,6 +2702,11 @@ void CMainApplication::UpdateHMDMatrixPose()
 				}
 			}
 			m_strPoseClasses += m_rDevClassChar[nDevice];
+
+			if (nDevice != 0)
+			{
+				m_rmat4DevicePose[nDevice] = m_rSeatedTrackingOffset * m_rmat4DevicePose[nDevice];
+			}
 		}
 	}
 
@@ -1940,7 +2773,7 @@ DX12RenderModel *CMainApplication::FindOrLoadRenderModel( vr::TrackedDeviceIndex
 		}
 
 		pRenderModel = new DX12RenderModel( pchRenderModelName );
-		if ( !pRenderModel->BInit( m_pDevice.Get(), m_pCommandList.Get(),  m_pCBVSRVHeap.Get(), unTrackedDeviceIndex, *pModel, *pTexture ) )
+		if ( !pRenderModel->BInit( m_pDevice.Get(), m_pCommandList.Get(),  m_pCBVSRVHeap.Get(), unTrackedDeviceIndex, *pModel, *pTexture, m_nCameraFrameWidth, m_nCameraFrameHeight ) )
 		{
 			dprintf( "Unable to create D3D12 model from render model %s\n", pchRenderModelName );
 			delete pRenderModel;
@@ -1990,7 +2823,7 @@ void CMainApplication::SetupRenderModels()
 	if( !m_pHMD )
 		return;
 
-	for( uint32_t unTrackedDevice = vr::k_unTrackedDeviceIndex_Hmd + 1; unTrackedDevice < vr::k_unMaxTrackedDeviceCount; unTrackedDevice++ )
+	for( uint32_t unTrackedDevice = vr::k_unTrackedDeviceIndex_Hmd; unTrackedDevice < vr::k_unMaxTrackedDeviceCount; unTrackedDevice++ )
 	{
 		if( !m_pHMD->IsTrackedDeviceConnected( unTrackedDevice ) )
 			continue;
@@ -2031,7 +2864,7 @@ DX12RenderModel::~DX12RenderModel()
 //-----------------------------------------------------------------------------
 // Purpose: Allocates and populates the D3D12 resources for a render model
 //-----------------------------------------------------------------------------
-bool DX12RenderModel::BInit( ID3D12Device *pDevice, ID3D12GraphicsCommandList *pCommandList, ID3D12DescriptorHeap *pCBVSRVHeap, vr::TrackedDeviceIndex_t unTrackedDeviceIndex, const vr::RenderModel_t & vrModel, const vr::RenderModel_TextureMap_t & vrDiffuseTexture )
+bool DX12RenderModel::BInit( ID3D12Device *pDevice, ID3D12GraphicsCommandList *pCommandList, ID3D12DescriptorHeap *pCBVSRVHeap, vr::TrackedDeviceIndex_t unTrackedDeviceIndex, const vr::RenderModel_t & vrModel, const vr::RenderModel_TextureMap_t & vrDiffuseTexture, uint32_t cameraFrameWidth, uint32_t cameraFrameHeight )
 {
 	m_unTrackedDeviceIndex = unTrackedDeviceIndex;
 	m_pCBVSRVHeap = pCBVSRVHeap;
